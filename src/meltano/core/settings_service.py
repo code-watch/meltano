@@ -65,6 +65,7 @@ class SettingsService(ABC):
         plugin_discovery_service: PluginDiscoveryService = None,
         config_service: ConfigService = None,
         show_hidden=True,
+        path_prefix=[],
         env_override={},
         config_override={},
     ):
@@ -76,6 +77,8 @@ class SettingsService(ABC):
         self.config_service = config_service or ConfigService(project)
 
         self.show_hidden = show_hidden
+        self.path_prefix = path_prefix
+        self.name_prefix = ".".join([*self.path_prefix, ""])
 
         self.env_override = env_override
         self.config_override = config_override
@@ -148,7 +151,7 @@ class SettingsService(ABC):
     def config_with_metadata(self, sources: List[SettingValueSource] = None, **kwargs):
         config = {}
         for setting in self.definitions():
-            value, source = self.get_with_source(setting.name, **kwargs)
+            value, source = self.get_with_source(setting.name, **kwargs, prefix=False)
             if sources and source not in sources:
                 logging.debug(f"Setting {setting.name} is not in sources: {sources}.")
                 continue
@@ -175,7 +178,10 @@ class SettingsService(ABC):
             if config["value"] is not None
         }
 
-    def get_with_source(self, name: str, redacted=False, session=None):
+    def get_with_source(self, name: str, redacted=False, session=None, prefix=True):
+        if prefix and self.name_prefix:
+            name = f"{self.name_prefix}{name}"
+
         try:
             setting_def = self.find_setting(name)
         except SettingMissingError:
@@ -261,6 +267,8 @@ class SettingsService(ABC):
         if isinstance(path, str):
             path = [path]
 
+        path = [*self.path_prefix, *path]
+
         name = ".".join(path)
 
         if value == REDACTED_VALUE:
@@ -330,7 +338,16 @@ class SettingsService(ABC):
 
     def reset(self, store=SettingValueStore.MELTANO_YML, session=None):
         def meltano_yml_resetter():
-            self._meltano_yml_config.clear()
+            config = self._meltano_yml_config
+
+            if self.path_prefix:
+                pop_at_path(config, self.path_prefix, None)
+                for key in config.keys():
+                    if key.startswith(self.name_prefix):
+                        config.pop(key)
+            else:
+                config.clear()
+
             self._update_meltano_yml_config()
             return True
 
@@ -338,7 +355,12 @@ class SettingsService(ABC):
             if not session:
                 return None
 
-            session.query(Setting).filter_by(namespace=self._db_namespace).delete()
+            settings = session.query(Setting).filter_by(namespace=self._db_namespace)
+            if self.name_prefix:
+                settings.filter(Setting.name.like(f"{self.name_prefix}%")).delete()
+            else:
+                settings.delete()
+
             session.commit()
             return True
 
@@ -367,6 +389,8 @@ class SettingsService(ABC):
         settings = []
         for setting in definitions:
             if setting.kind == "hidden" and not self.show_hidden:
+                continue
+            if self.name_prefix and not setting.name.startswith(self.name_prefix):
                 continue
 
             settings.append(setting)
